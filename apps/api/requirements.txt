@@ -8,7 +8,11 @@ psycopg[binary]>=3.2,<4
 alembic>=1.13,<2
 boto3>=1.35,<2
 httpx>=0.27,<1
-pytest>=8,<9
-pytest-asyncio>=0.24,<1
 
 python-multipart>=0.0.9,<1
+
+# Explicitly hold scanner-confirmed Python dependencies at fixed releases.
+certifi==2026.10.18
+msgpack==1.2.3
+setuptools==84.1.0
+urllib3==2.8.0

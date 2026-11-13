@@ -39,6 +39,9 @@ def test_ffmpeg_plan_uses_resolved_paths_and_pinned_timeline_order():
     assert plan.input_asset_ids == ("asset-a", "asset-b")
     assert plan.includes_audio is True
     assert plan.argv.count("-i") == 2
+    assert plan.argv.count("-protocol_whitelist") == 2
+    assert plan.argv.count("-format_whitelist") == 2
+    assert plan.argv.count("-codec_whitelist") == 2
     assert "/media/a.mp4" in plan.argv
     assert "/media/b.mp4" in plan.argv
     assert "[vout]" in plan.argv

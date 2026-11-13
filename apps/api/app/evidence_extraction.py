@@ -11,10 +11,13 @@ import asyncio
 import base64
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from app.scene_detection import SceneDetectionError, detect_scene_changes
 
 
 class EvidenceExtractionError(RuntimeError):
@@ -59,6 +62,57 @@ def _select_timestamps(values: list[float], duration: float, max_frames: int) ->
 
 
 async def _scene_change_timestamps(video_path: str, threshold: float, timeout_seconds: int) -> list[float]:
+    """Prefer PySceneDetect in a killable subprocess; retain FFmpeg as fallback."""
+    script = (
+        "import json, sys; "
+        "from app.scene_detection import detect_scene_changes; "
+        "print(json.dumps(detect_scene_changes(sys.argv[1], float(sys.argv[2]))))"
+    )
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", script, video_path, str(threshold),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=max(1, timeout_seconds),
+        )
+        if process.returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace")[-1200:]
+            raise SceneDetectionError(f"PySceneDetect subprocess failed: {detail}")
+        values = json.loads(stdout.decode("utf-8"))
+        if not isinstance(values, list):
+            raise SceneDetectionError("PySceneDetect returned an invalid result")
+        return [float(value) for value in values]
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.communicate()
+        raise
+    except asyncio.TimeoutError:
+        if process is not None and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.communicate()
+        return await _ffmpeg_scene_change_timestamps(video_path, threshold, timeout_seconds)
+    except (OSError, ValueError, json.JSONDecodeError, SceneDetectionError):
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.communicate()
+        return await _ffmpeg_scene_change_timestamps(video_path, threshold, timeout_seconds)
+
+
+async def _ffmpeg_scene_change_timestamps(
+    video_path: str, threshold: float, timeout_seconds: int,
+) -> list[float]:
+    """Fallback detector, bounded by the same caller-provided timeout."""
     _, stderr = await _run([
         "ffmpeg", "-hide_banner", "-nostdin", "-v", "info", "-i", video_path,
         "-vf", f"select='gt(scene,{threshold})',showinfo", "-an", "-f", "null", "-",
@@ -67,7 +121,6 @@ async def _scene_change_timestamps(video_path: str, threshold: float, timeout_se
         r"pts_time:([0-9]+(?:\.[0-9]+)?)",
         stderr.decode("utf-8", errors="replace"),
     )]
-
 
 async def _perceptual_hash(image_path: str | Path) -> str | None:
     """Compute a compact 64-bit difference hash using FFmpeg only."""

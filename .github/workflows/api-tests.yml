@@ -31,9 +31,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.16"
       - name: Install API dependencies
-        run: pip install -r apps/api/requirements.txt
+        run: pip install -r apps/api/requirements-dev.txt
       - name: Install FFmpeg and FFprobe for real media integration tests
         run: |
           sudo apt-get update
@@ -49,10 +49,10 @@ jobs:
       - name: Set up Node.js for Story Graph Explorer
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "22.23.5"
       - name: Install web dependencies
         working-directory: apps/web
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
       - name: Install Playwright Chromium
         working-directory: apps/web
         run: npx playwright install --with-deps chromium
@@ -74,3 +74,249 @@ jobs:
         env:
           DATABASE_URL: postgresql+asyncpg://editflow:editflow@localhost:5432/editflow_test
         run: pytest -q
+
+  container-sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate production Compose configuration
+        env:
+          DATABASE_URL: postgresql+asyncpg://editflow:ci-password@db.example:5432/editflow?ssl=require
+          EDITFLOW_AUTH_SECRET: ci-only-secret-value-with-at-least-32-characters
+          EDITFLOW_EMAIL_PUBLIC_URL: https://editflow.example
+          EDITFLOW_CORS_ORIGINS: https://editflow.example
+          EDITFLOW_EMAIL_SMTP_HOST: smtp.example
+          EDITFLOW_EMAIL_SMTP_USERNAME: ci-user
+          EDITFLOW_EMAIL_SMTP_PASSWORD: ci-password
+          EDITFLOW_EMAIL_FROM: noreply@editflow.example
+          S3_BUCKET: editflow-ci-bucket
+        run: docker compose -f docker-compose.production.yml config --quiet
+
+      - name: Build the API image from its production Dockerfile
+        run: docker build --pull --target api -t editflow-api:sbom ./apps/api
+
+      - name: Verify API image is unprivileged and excludes FFmpeg executables
+        run: |
+          docker run --rm --entrypoint sh editflow-api:sbom -c 'set -eu; test "$(id -u)" = "10001"; ! command -v ffmpeg >/dev/null 2>&1; ! command -v ffprobe >/dev/null 2>&1; ! python -m pip --version >/dev/null 2>&1; python -c "import importlib.metadata as m; e={\"certifi\":\"2026.10.18\",\"msgpack\":\"1.2.3\",\"setuptools\":\"84.1.0\",\"urllib3\":\"2.8.0\"}; assert all(m.version(k)==v for k,v in e.items())"'
+          docker run --rm --entrypoint python editflow-api:sbom -c 'import importlib.util; assert all(importlib.util.find_spec(name) is None for name in ("pytest", "pytest_asyncio", "cv2", "scenedetect"))'
+
+      - name: Build isolated media worker image
+        run: docker build --pull --target worker -t editflow-worker:sbom ./apps/api
+
+      - name: Verify media worker is unprivileged and has pinned FFmpeg tools
+        run: |
+          docker run --rm --entrypoint sh editflow-worker:sbom -c 'set -eu; test "$(id -u)" = "10001"; ! python -m pip --version >/dev/null 2>&1; python -c "import cv2, scenedetect, importlib.metadata as m; e={\"certifi\":\"2026.10.18\",\"msgpack\":\"1.2.3\",\"setuptools\":\"84.1.0\",\"urllib3\":\"2.8.0\"}; assert all(m.version(k)==v for k,v in e.items())"; test "$(dpkg-query -W -f="\${Version}" ffmpeg)" = "7:7.1.5-0+deb13u1"; ! ffmpeg -hide_banner -hwaccels | grep -qx cuda; ! ffmpeg -hide_banner -decoders | grep -E "(_cuvid|_nvdec)([[:space:]]|$)"; ! ffmpeg -buildconf 2>&1 | grep -q -- "--enable-mbedtls"; ffmpeg -version; ffprobe -version'
+
+      - name: Prepare SBOM output directory
+        run: mkdir -p sbom
+
+      - name: Generate CycloneDX SBOM for the built API image
+        uses: anchore/sbom-action@v0
+        with:
+          image: editflow-api:sbom
+          format: cyclonedx-json
+          output-file: sbom/editflow-api.cdx.json
+          upload-artifact: false
+
+      - name: Generate CycloneDX SBOM for isolated media worker image
+        uses: anchore/sbom-action@v0
+        with:
+          image: editflow-worker:sbom
+          format: cyclonedx-json
+          output-file: sbom/editflow-worker.cdx.json
+          upload-artifact: false
+
+      - name: Record pinned production base image references
+        run: |
+          {
+            echo "=== API Dockerfile ==="
+            cat apps/api/Dockerfile
+            echo "=== Web Dockerfile ==="
+            cat apps/web/Dockerfile
+          } > sbom/pinned-image-references.txt
+
+      - name: Capture FFmpeg build configuration and OS package versions
+        run: |
+          docker run --rm --entrypoint sh editflow-worker:sbom -c 'set -eu
+            test "$(dpkg-query -W -f="\${Version}" ffmpeg)" = "7:7.1.5-0+deb13u1"
+            echo "=== FFmpeg Debian package version pin: verified ==="
+            echo "=== Python version ==="
+            python --version
+            echo "=== FFmpeg version ==="
+            ffmpeg -version
+            echo "=== FFmpeg build configuration ==="
+            ffmpeg -buildconf
+            echo "=== FFprobe version ==="
+            ffprobe -version
+            echo "=== Installed Debian packages ==="
+            dpkg-query -W | sort
+          ' > sbom/container-runtime-and-licenses.txt
+
+      - name: Preserve Debian package copyright and license files
+        run: |
+          docker run --rm --entrypoint sh editflow-worker:sbom -c 'set -eu
+            find /usr/share/doc -type f -name copyright -print0 | tar --null -czf - --files-from -
+          ' > sbom/debian-copyright-files.tar.gz
+
+      - name: Build the web production build stage
+        run: docker build --pull --target build -t editflow-web-build:sbom ./apps/web
+
+      - name: Generate CycloneDX SBOM for web build dependencies
+        uses: anchore/sbom-action@v0
+        with:
+          image: editflow-web-build:sbom
+          format: cyclonedx-json
+          output-file: sbom/editflow-web-build.cdx.json
+          upload-artifact: false
+
+      - name: Preserve Node.js and npm license texts
+        run: |
+          docker run --rm --entrypoint sh editflow-web-build:sbom -c 'set -eu
+            find /usr/local -type f \( -iname "license*" -o -iname "copying*" \) -print | tar -czf - -T -
+          ' > sbom/node-license-files.tar.gz
+
+      - name: Capture exact npm dependency tree, generated lockfile, and build tool versions
+        run: |
+          docker run --rm --entrypoint sh editflow-web-build:sbom -c 'set -eu
+            test "$(node --version)" = "v22.23.5"
+            node --version
+            npm --version
+            cat /app/package-lock.json
+          ' > sbom/web-package-lock.generated.json
+          docker run --rm --entrypoint sh editflow-web-build:sbom -c 'npm ls --all --json || true' > sbom/web-build-dependencies.json
+
+      - name: Build the web production runtime image
+        run: docker build --pull -t editflow-web:sbom ./apps/web
+
+      - name: Verify web runtime is non-root and Nginx configuration is valid
+        run: |
+          docker run --rm --add-host editflow-api.railway.internal:127.0.0.1 --entrypoint sh editflow-web:sbom -c 'set -eu; test "$(id -u)" = "101"; nginx -t'
+
+      - name: Validate public Nginx proxy configuration
+        run: |
+          mkdir -p deploy/tls
+          openssl req -x509 -nodes -newkey rsa:2048 -keyout deploy/tls/privkey.pem -out deploy/tls/fullchain.pem -subj "/CN=localhost" -days 1 >/dev/null 2>&1
+          chmod 644 deploy/tls/privkey.pem
+          docker run --rm --add-host api:127.0.0.1 --add-host web:127.0.0.1 \
+            -v "$PWD/deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro" \
+            -v "$PWD/deploy/tls:/etc/nginx/tls:ro" \
+            --entrypoint nginx editflow-web:sbom -t
+
+      - name: Generate CycloneDX SBOM for web runtime image
+        uses: anchore/sbom-action@v0
+        with:
+          image: editflow-web:sbom
+          format: cyclonedx-json
+          output-file: sbom/editflow-web-runtime.cdx.json
+          upload-artifact: false
+
+      - name: Create worker license metadata inventory
+        run: python tools/sbom_license_inventory.py sbom/editflow-worker.cdx.json sbom/worker-license-inventory.csv
+
+      - name: Scan API production image with Trivy
+        id: trivy_api
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: editflow-api:sbom
+          version: v0.76.2
+          vuln-type: os,library
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: '1'
+          format: json
+          output: sbom/trivy-api-vulnerabilities.json
+
+      - name: Scan isolated media worker image with Trivy
+        id: trivy_worker
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: editflow-worker:sbom
+          version: v0.76.2
+          vuln-type: os,library
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: '1'
+          format: json
+          output: sbom/trivy-worker-vulnerabilities.json
+
+      - name: Scan web production image with Trivy
+        id: trivy_web
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: editflow-web:sbom
+          version: v0.76.2
+          vuln-type: os,library
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: '1'
+          format: json
+          output: sbom/trivy-web-vulnerabilities.json
+
+      - name: VEX-aware scan API production image
+        id: trivy_api_vex
+        continue-on-error: true
+        run: |
+          trivy image --vex docs/security/EDITFLOW-ffmpeg.openvex.json --scanners vuln --vuln-type os,library --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 --format json --output sbom/trivy-api-vex.json editflow-api:sbom
+
+      - name: VEX-aware scan isolated media worker image
+        id: trivy_worker_vex
+        continue-on-error: true
+        run: |
+          trivy image --vex docs/security/EDITFLOW-ffmpeg.openvex.json --scanners vuln --vuln-type os,library --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 --format json --output sbom/trivy-worker-vex.json editflow-worker:sbom
+
+      - name: VEX-aware scan web production image
+        id: trivy_web_vex
+        continue-on-error: true
+        run: |
+          trivy image --vex docs/security/EDITFLOW-ffmpeg.openvex.json --scanners vuln --vuln-type os,library --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 --format json --output sbom/trivy-web-vex.json editflow-web:sbom
+
+      - name: Capture Nginx and Alpine runtime package versions
+        run: |
+          docker run --rm --entrypoint sh editflow-web:sbom -c 'set -eu
+            nginx -v 2>&1
+            cat /etc/alpine-release
+            apk info -vv | sort
+          ' > sbom/web-runtime-and-os-packages.txt
+
+      - name: Preserve Alpine package license files
+        run: |
+          docker run --rm --entrypoint sh editflow-web:sbom -c 'set -eu
+            find /usr/share -type f \( -iname "license*" -o -iname "copyright*" -o -iname "copying*" \) -print | tar -czf - -T -
+          ' > sbom/alpine-license-files.tar.gz
+
+      - name: Create API license metadata inventory
+        run: python tools/sbom_license_inventory.py sbom/editflow-api.cdx.json sbom/api-license-inventory.csv
+
+      - name: Create web build license metadata inventory
+        run: python tools/sbom_license_inventory.py sbom/editflow-web-build.cdx.json sbom/web-build-license-inventory.csv
+
+      - name: Create web runtime license metadata inventory
+        run: python tools/sbom_license_inventory.py sbom/editflow-web-runtime.cdx.json sbom/web-runtime-license-inventory.csv
+
+      - name: Upload SBOM and security scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: editflow-full-stack-sbom-${{ github.sha }}
+          path: sbom/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Enforce container vulnerability gate
+        if: always()
+        env:
+          API_SCAN_OUTCOME: ${{ steps.trivy_api_vex.outcome }}
+          WORKER_SCAN_OUTCOME: ${{ steps.trivy_worker_vex.outcome }}
+          WEB_SCAN_OUTCOME: ${{ steps.trivy_web_vex.outcome }}
+        run: |
+          set -eu
+          if [ "$API_SCAN_OUTCOME" != "success" ] || [ "$WORKER_SCAN_OUTCOME" != "success" ] || [ "$WEB_SCAN_OUTCOME" != "success" ]; then
+            echo "::error::Trivy found remaining affected vulnerabilities after applying the reviewed FFmpeg VEX, or a VEX scan failed. Inspect raw and VEX-filtered reports before approving this PR."
+            exit 1
+          fi

@@ -1,11 +1,11 @@
-# Standalone production topology. No development database or published API ports.
-# Place TLS certificates at deploy/tls/fullchain.pem and deploy/tls/privkey.pem.
-# Inject every secret via the host's secret manager / protected environment.
+# Production topology with isolated, unprivileged application containers.
+# Keep TLS private keys readable by the proxy container and inject secrets from a secret manager.
 # docker compose -f docker-compose.production.yml up -d --build
 services:
   api:
     build:
       context: ./apps/api
+      target: api
     environment: &editflow_runtime
       EDITFLOW_ENV: production
       DATABASE_URL: ${DATABASE_URL:?Set managed PostgreSQL URL with TLS}
@@ -27,6 +27,20 @@ services:
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
     expose:
       - "8000"
+    networks:
+      - frontend
+      - api-egress
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m,uid=10001,gid=10001,mode=1770
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 256
+    mem_limit: ${API_MEMORY_LIMIT:-1g}
+    cpus: ${API_CPUS:-1.0}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -38,13 +52,40 @@ services:
   render-worker:
     build:
       context: ./apps/api
+      target: worker
     command: ["python", "-m", "app.worker_main"]
+    networks:
+      - worker-egress
     environment:
-      <<: *editflow_runtime
+      EDITFLOW_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?Set managed PostgreSQL URL with TLS}
+      EDITFLOW_STORAGE_BACKEND: s3
+      S3_BUCKET: ${S3_BUCKET:?Set production S3 bucket}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
       EDITFLOW_WORK_ROOT: /tmp/editflow-work
       WORKER_POLL_SECONDS: "2"
       RENDER_TIMEOUT_SECONDS: "3600"
       RENDER_LEASE_SECONDS: "120"
+      EDITFLOW_ASR_API_KEY: ${EDITFLOW_ASR_API_KEY:-}
+      EDITFLOW_ASR_ENDPOINT: ${EDITFLOW_ASR_ENDPOINT:-https://api.openai.com/v1/audio/transcriptions}
+      EDITFLOW_ASR_MODEL: ${EDITFLOW_ASR_MODEL:-whisper-1}
+      EDITFLOW_VISION_API_KEY: ${EDITFLOW_VISION_API_KEY:-}
+      EDITFLOW_VISION_ENDPOINT: ${EDITFLOW_VISION_ENDPOINT:-https://api.openai.com/v1/chat/completions}
+      EDITFLOW_VISION_MODEL: ${EDITFLOW_VISION_MODEL:-gpt-4o-mini}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=4g,uid=10001,gid=10001,mode=1770
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 256
+    mem_limit: ${WORKER_MEMORY_LIMIT:-4g}
+    cpus: ${WORKER_CPUS:-2.0}
     restart: unless-stopped
     depends_on:
       api:
@@ -55,20 +96,57 @@ services:
       context: ./apps/web
     image: editflow-web:production
     expose:
-      - "80"
+      - "8080"
+    networks:
+      - frontend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,uid=101,gid=101,mode=1770
+      - /var/cache/nginx:rw,noexec,nosuid,size=32m,uid=101,gid=101,mode=0755
+      - /run:rw,noexec,nosuid,size=16m,uid=101,gid=101,mode=0755
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 128
     restart: unless-stopped
 
   proxy:
-    image: nginx:1.27-alpine
+    image: nginx:1.30.6-alpine3.24-slim@sha256:f65ed258206d1eb6c4eb6141111715a2cf94ac0a4ec9675fc2da186f7aadb163
     depends_on:
       api:
         condition: service_healthy
       web:
         condition: service_started
+    networks:
+      - frontend
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./deploy/tls:/etc/nginx/tls:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+      - /var/cache/nginx:rw,noexec,nosuid,size=64m
+      - /run:rw,noexec,nosuid,size=16m
+      - /var/log/nginx:rw,noexec,nosuid,size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    init: true
+    pids_limit: 128
     restart: unless-stopped
+
+networks:
+  frontend:
+    driver: bridge
+  api-egress:
+    driver: bridge
+  worker-egress:
+    driver: bridge

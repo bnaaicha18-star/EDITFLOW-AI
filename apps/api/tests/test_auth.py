@@ -624,3 +624,29 @@ async def test_failed_action_email_invalidates_undelivered_token(db_session, mon
         select(AuthActionToken).where(AuthActionToken.id == token_id)
     )
     assert stored.consumed_at is not None
+
+
+@pytest.mark.parametrize("environment,secure_expected", [
+    ("staging", True),
+    ("production", True),
+    ("development", False),
+    ("test", False),
+    ("local", False),
+])
+def test_auth_cookies_use_secure_flag_outside_local_environments(monkeypatch, environment, secure_expected):
+    from starlette.responses import Response
+    from app.config import settings
+    import app.main as main
+
+    monkeypatch.setattr(settings, "environment", environment)
+    response = Response()
+    main._set_auth_cookies(response, "access-token", "refresh-token")
+    cookies = response.headers.getlist("set-cookie")
+    assert len(cookies) == 3
+    assert all(("; secure" in cookie.lower()) is secure_expected for cookie in cookies)
+
+    cleared = Response()
+    main._clear_auth_cookies(cleared)
+    clear_headers = cleared.headers.getlist("set-cookie")
+    assert len(clear_headers) == 3
+    assert all(("; secure" in cookie.lower()) is secure_expected for cookie in clear_headers)

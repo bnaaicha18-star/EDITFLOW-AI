@@ -5,6 +5,12 @@ import asyncio
 import json
 from dataclasses import dataclass
 
+from app.media_policy import (
+    SUPPORTED_AUDIO_CODECS,
+    SUPPORTED_VIDEO_CODECS,
+    media_input_options,
+)
+
 
 class MediaProbeError(RuntimeError):
     pass
@@ -27,7 +33,8 @@ async def probe_media(path: str, timeout_seconds: int = 30) -> MediaInfo:
         raise ValueError("timeout_seconds must be between 1 and 300")
     try:
         process = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error", "-show_entries",
+            "ffprobe", "-v", "error", *media_input_options(),
+            "-show_entries",
             "format=duration,format_name:stream=codec_type,codec_name,width,height",
             "-of", "json", path,
             stdin=asyncio.subprocess.DEVNULL,
@@ -62,13 +69,23 @@ async def probe_media(path: str, timeout_seconds: int = 30) -> MediaInfo:
         raise MediaProbeError(f"ffprobe returned invalid media metadata: {exc}") from exc
     if video is None:
         raise MediaProbeError("Input asset has no video stream")
+    format_name = fmt.get("format_name")
+    formats = set(str(format_name or "").split(","))
+    if not formats.intersection({"mov", "matroska"}):
+        raise MediaProbeError("Unsupported media container; only MP4, MOV, and WebM are accepted")
+    video_codec = video.get("codec_name")
+    if video_codec not in SUPPORTED_VIDEO_CODECS:
+        raise MediaProbeError(f"Unsupported video codec: {video_codec or 'unknown'}")
+    audio_codec = audio.get("codec_name") if audio else None
+    if audio_codec is not None and audio_codec not in SUPPORTED_AUDIO_CODECS:
+        raise MediaProbeError(f"Unsupported audio codec: {audio_codec}")
     return MediaInfo(
         duration_seconds=duration,
         has_video=True,
         has_audio=audio is not None,
         width=int(video["width"]) if video.get("width") else None,
         height=int(video["height"]) if video.get("height") else None,
-        video_codec=video.get("codec_name"),
-        audio_codec=audio.get("codec_name") if audio else None,
-        format_name=fmt.get("format_name"),
+        video_codec=video_codec,
+        audio_codec=audio_codec,
+        format_name=format_name,
     )

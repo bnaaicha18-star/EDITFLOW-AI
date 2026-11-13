@@ -53,6 +53,7 @@ services:
   render-worker:
     build:
       context: ./apps/api
+      target: worker
     command: ["python", "-m", "app.worker_main"]
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://editflow:editflow@postgres:5432/editflow}

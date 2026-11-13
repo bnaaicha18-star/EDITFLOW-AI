@@ -1,0 +1,2 @@
+# Media-analysis dependencies are installed only in the isolated render worker.
+scenedetect-headless>=0.7.3,<1

@@ -149,8 +149,14 @@ def _cookie_auth_requested(request: Request | None) -> bool:
     return settings.environment.strip().lower() in {"production", "prod"} or bool(request and request.headers.get("x-editflow-cookie-auth") == "1")
 
 
+def _auth_cookie_secure() -> bool:
+    # Staging and every deployed environment must use Secure cookies.
+    # Plain HTTP is permitted only for explicit local/test environments.
+    return settings.environment.strip().lower() not in {"development", "dev", "test", "local"}
+
+
 def _set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
-    secure = settings.environment.strip().lower() in {"production", "prod"}
+    secure = _auth_cookie_secure()
     response.set_cookie("editflow_access", access_token, max_age=settings.auth_access_token_seconds,
         httponly=True, secure=secure, samesite="lax", path="/")
     response.set_cookie("editflow_refresh", refresh_token, max_age=settings.auth_refresh_token_days * 86400,
@@ -160,7 +166,7 @@ def _set_auth_cookies(response: Response, access_token: str, refresh_token: str)
 
 
 def _clear_auth_cookies(response: Response) -> None:
-    secure = settings.environment.strip().lower() in {"production", "prod"}
+    secure = _auth_cookie_secure()
     for name in ("editflow_access", "editflow_refresh", "editflow_csrf"):
         response.delete_cookie(name, path="/", secure=secure, httponly=name != "editflow_csrf", samesite="lax")
 
